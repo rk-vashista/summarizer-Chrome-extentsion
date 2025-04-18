@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>What Did I Just Read?</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module">
+    import { SvelteComponent } from './popup/Popup.svelte';
+    
+    // Mount the Svelte component
+    new SvelteComponent({
+      target: document.getElementById('app')
+    });
+  </script>
+</body>
+</html>
