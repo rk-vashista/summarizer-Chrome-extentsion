@@ -4,6 +4,9 @@ import storageManager from '../storage';
 
 // Listen for messages from content scripts and popup
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Log incoming messages for debugging
+  console.log('Background received message:', message.type, 'from:', sender.tab ? 'content script' : 'popup');
+  
   switch (message.type) {
     case 'SUMMARIZE_PAGE': 
       handleSummarizePage(message, sender);
@@ -35,6 +38,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
+// Helper function to send a message to a specific tab
+function sendMessageToTab(tabId, message) {
+  if (tabId) {
+    console.log(`Sending message to tab ${tabId}:`, message.type);
+    chrome.tabs.sendMessage(tabId, message)
+      .then(() => console.log(`Message ${message.type} sent successfully to tab ${tabId}`))
+      .catch(error => {
+        console.error(`Failed to send message to tab ${tabId}:`, error);
+        // If we can't send to tab directly, try broadcasting to all
+        chrome.runtime.sendMessage(message)
+          .catch(err => console.error('Failed to broadcast message:', err));
+      });
+  } else {
+    // Fall back to broadcasting if no tab ID
+    console.log('Broadcasting message:', message.type);
+    chrome.runtime.sendMessage(message)
+      .catch(error => console.error('Failed to broadcast message:', error));
+  }
+}
+
 // Handle summarize page request
 async function handleSummarizePage(message, sender) {
   try {
@@ -52,38 +75,16 @@ async function handleSummarizePage(message, sender) {
       return;
     }
     
-    // Execute content script to extract page content
-    chrome.scripting.executeScript({
-      target: { tabId },
-      function: extractPageContent
-    }, async (results) => {
-      if (chrome.runtime.lastError) {
-        console.error('Script execution error:', chrome.runtime.lastError);
-        chrome.runtime.sendMessage({
-          type: 'SUMMARIZATION_ERROR',
-          error: chrome.runtime.lastError.message || 'Could not extract page content'
-        });
-        return;
-      }
-      
-      if (!results || results.length === 0) {
-        console.error('No results returned from content script');
-        chrome.runtime.sendMessage({
-          type: 'SUMMARIZATION_ERROR',
-          error: 'Could not extract page content'
-        });
-        return;
-      }
-      
-      const content = results[0].result;
-      console.log('Content extracted successfully, length:', content.content.length);
-      
-      // Check if we have a cached summary
+    // Keep track of the tab info to use for responding
+    let activeTabUrl = message.url || (sender.tab && sender.tab.url);
+    
+    // Try to get cached summary first
+    if (activeTabUrl) {
       try {
-        const cachedSummary = await storageManager.getSummary(content.url);
+        const cachedSummary = await storageManager.getSummary(activeTabUrl);
         if (cachedSummary) {
-          console.log('Using cached summary');
-          chrome.runtime.sendMessage({
+          console.log('Using cached summary without extraction');
+          sendMessageToTab(tabId, {
             type: 'SUMMARIZATION_COMPLETE',
             summary: cachedSummary.summary
           });
@@ -92,6 +93,33 @@ async function handleSummarizePage(message, sender) {
       } catch (error) {
         console.warn('Error checking for cached summary:', error);
       }
+    }
+    
+    // Execute content script to extract page content
+    chrome.scripting.executeScript({
+      target: { tabId },
+      function: extractPageContent
+    }, async (results) => {
+      if (chrome.runtime.lastError) {
+        console.error('Script execution error:', chrome.runtime.lastError);
+        sendMessageToTab(tabId, {
+          type: 'SUMMARIZATION_ERROR',
+          error: chrome.runtime.lastError.message || 'Could not extract page content'
+        });
+        return;
+      }
+      
+      if (!results || results.length === 0) {
+        console.error('No results returned from content script');
+        sendMessageToTab(tabId, {
+          type: 'SUMMARIZATION_ERROR',
+          error: 'Could not extract page content'
+        });
+        return;
+      }
+      
+      const content = results[0].result;
+      console.log('Content extracted successfully, length:', content.content.length);
       
       // No cached summary, process the content
       try {
@@ -117,14 +145,21 @@ async function handleSummarizePage(message, sender) {
           console.warn('Error saving summary to storage:', storageError);
         }
         
-        // Notify popup that summarization is complete
-        chrome.runtime.sendMessage({
+        // Notify both the tab and any popups that summarization is complete
+        sendMessageToTab(tabId, {
           type: 'SUMMARIZATION_COMPLETE',
           summary
         });
+        
+        // Also broadcast to make sure popup gets it
+        chrome.runtime.sendMessage({
+          type: 'SUMMARIZATION_COMPLETE',
+          summary,
+          url: content.url
+        }).catch(err => console.log('Broadcast error (expected if no popups):', err.message));
       } catch (error) {
         console.error('Summarization error:', error);
-        chrome.runtime.sendMessage({
+        sendMessageToTab(tabId, {
           type: 'SUMMARIZATION_ERROR',
           error: error.message || 'Failed to generate summary'
         });
@@ -132,10 +167,17 @@ async function handleSummarizePage(message, sender) {
     });
   } catch (error) {
     console.error('Error handling summarize page request:', error);
-    chrome.runtime.sendMessage({
-      type: 'SUMMARIZATION_ERROR',
-      error: error.message || 'Failed to start summarization process'
-    });
+    if (sender.tab && sender.tab.id) {
+      sendMessageToTab(sender.tab.id, {
+        type: 'SUMMARIZATION_ERROR',
+        error: error.message || 'Failed to start summarization process'
+      });
+    } else {
+      chrome.runtime.sendMessage({
+        type: 'SUMMARIZATION_ERROR',
+        error: error.message || 'Failed to start summarization process'
+      });
+    }
   }
 }
 
@@ -160,6 +202,7 @@ async function handleGetCachedSummary(message, sender, sendResponse) {
 async function handleGenerateQuiz(message, sender, sendResponse) {
   try {
     const { url, summary } = message;
+    const tabId = sender.tab && sender.tab.id;
     
     // If we have a summary, use it directly
     if (summary) {
@@ -169,21 +212,36 @@ async function handleGenerateQuiz(message, sender, sendResponse) {
         // Store the quiz
         await storageManager.saveQuiz(url || (sender.tab ? sender.tab.url : ''), quiz);
         
-        // Notify any listeners that quiz generation is complete
-        chrome.runtime.sendMessage({
-          type: 'QUIZ_GENERATION_COMPLETE',
-          quiz
-        });
+        // Notify the tab that quiz generation is complete
+        if (tabId) {
+          sendMessageToTab(tabId, {
+            type: 'QUIZ_GENERATION_COMPLETE',
+            quiz
+          });
+        } else {
+          // Fallback to broadcasting
+          chrome.runtime.sendMessage({
+            type: 'QUIZ_GENERATION_COMPLETE',
+            quiz
+          });
+        }
         
         sendResponse({ success: true });
       } catch (error) {
         console.error('Quiz generation error:', error);
         
-        // Notify any listeners that quiz generation failed
-        chrome.runtime.sendMessage({
-          type: 'QUIZ_GENERATION_ERROR',
-          error: error.message
-        });
+        // Notify the tab that quiz generation failed
+        if (tabId) {
+          sendMessageToTab(tabId, {
+            type: 'QUIZ_GENERATION_ERROR',
+            error: error.message
+          });
+        } else {
+          chrome.runtime.sendMessage({
+            type: 'QUIZ_GENERATION_ERROR',
+            error: error.message
+          });
+        }
         
         sendResponse({ error: error.message });
       }
@@ -201,21 +259,35 @@ async function handleGenerateQuiz(message, sender, sendResponse) {
           // Store the quiz
           await storageManager.saveQuiz(url, quiz);
           
-          // Notify any listeners that quiz generation is complete
-          chrome.runtime.sendMessage({
-            type: 'QUIZ_GENERATION_COMPLETE',
-            quiz
-          });
+          // Notify the tab that quiz generation is complete
+          if (tabId) {
+            sendMessageToTab(tabId, {
+              type: 'QUIZ_GENERATION_COMPLETE',
+              quiz
+            });
+          } else {
+            chrome.runtime.sendMessage({
+              type: 'QUIZ_GENERATION_COMPLETE',
+              quiz
+            });
+          }
           
           sendResponse({ success: true });
         } catch (error) {
           console.error('Quiz generation error:', error);
           
-          // Notify any listeners that quiz generation failed
-          chrome.runtime.sendMessage({
-            type: 'QUIZ_GENERATION_ERROR',
-            error: error.message
-          });
+          // Notify the tab that quiz generation failed
+          if (tabId) {
+            sendMessageToTab(tabId, {
+              type: 'QUIZ_GENERATION_ERROR',
+              error: error.message
+            });
+          } else {
+            chrome.runtime.sendMessage({
+              type: 'QUIZ_GENERATION_ERROR',
+              error: error.message
+            });
+          }
           
           sendResponse({ error: error.message });
         }
@@ -225,9 +297,23 @@ async function handleGenerateQuiz(message, sender, sendResponse) {
     
     // If we get here, we don't have a summary or a cached summary
     sendResponse({ error: 'No summary available to generate quiz' });
+    
+    if (tabId) {
+      sendMessageToTab(tabId, {
+        type: 'QUIZ_GENERATION_ERROR',
+        error: 'No summary available to generate quiz'
+      });
+    }
   } catch (error) {
     console.error('Error handling generate quiz request:', error);
     sendResponse({ error: error.message });
+    
+    if (sender.tab && sender.tab.id) {
+      sendMessageToTab(sender.tab.id, {
+        type: 'QUIZ_GENERATION_ERROR',
+        error: error.message
+      });
+    }
   }
 }
 
